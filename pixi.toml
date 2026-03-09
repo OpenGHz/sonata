@@ -1,0 +1,57 @@
+[workspace]
+authors = ["OpenGHz"]
+channels = [
+    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/",
+    "conda-forge",
+    "pytorch",
+    "nvidia/label/cuda-12.4.1",
+    "nvidia",
+]
+description = "Pixi environments for using Sonata as a package and for running demos."
+name = "sonata"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[system-requirements]
+cuda = "12.4"
+
+[dependencies]
+gcc = "13.2.*"
+gxx = "13.2.*"
+ninja = "*"
+pip = "*"
+python = "3.10.*"
+pytorch = { version = "2.5.0.*", channel = "pytorch" }
+pytorch-cuda = { version = "12.4.*", channel = "pytorch" }
+torchaudio = { version = "2.5.0.*", channel = "pytorch" }
+torchvision = { version = "0.20.0.*", channel = "pytorch" }
+# used to build sonata
+setuptools = ">=41,<81"
+# used to build flash-attn
+psutil = "*"
+
+[pypi-options]
+find-links = [{ url = "https://data.pyg.org/whl/torch-2.5.0+cu124.html" }]
+no-build-isolation = ["flash-attn", "sonata"]
+index-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/"
+extra-index-urls = ["https://mirrors.aliyun.com/pypi/simple/"]
+
+[pypi-dependencies]
+# may be hard to build flash-attn from source
+# flash-attn = { git = "https://github.com/Dao-AILab/flash-attention.git" }
+huggingface-hub = "*"
+sonata = { path = ".", editable = true }
+spconv-cu124 = "*"
+timm = "*"
+torch-scatter = "*"
+
+[feature.demo.dependencies]
+numpy = "1.26.4.*"
+open3d = "*"
+psutil = "*"
+
+[feature.demo.pypi-dependencies]
+fast-pytorch-kmeans = "*"
+
+[environments]
+demo = ["demo"]
