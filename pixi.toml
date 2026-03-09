@@ -29,6 +29,7 @@ torchvision = { version = "0.20.0.*", channel = "pytorch" }
 setuptools = ">=41,<81"
 # used to build flash-attn
 psutil = "*"
+addict = "*"
 
 [pypi-options]
 find-links = [{ url = "https://data.pyg.org/whl/torch-2.5.0+cu124.html" }]
@@ -48,7 +49,7 @@ torch-scatter = "*"
 [feature.demo.dependencies]
 numpy = "1.26.4.*"
 open3d = "*"
-psutil = "*"
+scipy = ">=1.15.2,<2"
 
 [feature.demo.pypi-dependencies]
 fast-pytorch-kmeans = "*"
