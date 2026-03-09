@@ -63,6 +63,7 @@ This repo provide two ways of installation: **standalone mode** and **package mo
   python demo/0_pca.py
   python demo/1_similarity.py
   python demo/2_sem_seg.py  # linear probed head on ScanNet
+  python demo/3_batch_forward.py  # multi-frame and multi-sequence temporal fusion
   ```
 
 <div align='left'>
@@ -90,6 +91,8 @@ This repo provide two ways of installation: **standalone mode** and **package mo
     "color": numpy.array,  # (N, 3)
     "normal": numpy.array,  # (N, 3)
     "batch": numpy.array,  # (N,) optional
+    "sequence": numpy.array,  # (N,) optional, sequence id for temporal fusion
+    "frame": numpy.array,  # (N,) optional, larger value means newer frame
     "segment": numpy.array,  # (N,) optional
   }
   ```
@@ -151,6 +154,20 @@ This repo provide two ways of installation: **standalone mode** and **package mo
   from sonata.model import PointTransformerV3
   model = PointTransformerV3.from_pretrained("facebook/sonata", **custom_config).cuda()
   ```
+    To enable the MEM-style spatio-temporal fusion described in Section III-C, use the same pre-trained checkpoint with the following config:
+    ```python
+    temporal_config = dict(
+      enable_temporal=True,
+      temporal_every=4,
+      temporal_return_current=True,
+    )
+    model = sonata.load(
+      "sonata",
+      repo_id="facebook/sonata",
+      custom_config=temporal_config,
+    ).cuda()
+    ```
+    This temporal branch does not introduce extra learnable parameters. It reuses the pre-trained PTv3 weights, keeps the single-frame path unchanged, and only activates when both `sequence` and `frame` are provided.
 - **Inference.** Run the inference by running the following command:
   ```python
   point = transform(point)
@@ -159,6 +176,23 @@ This repo provide two ways of installation: **standalone mode** and **package mo
           point[key] = point[key].cuda(non_blocking=True)
   point = model(point)
   ```
+    For temporal fusion, collate frames from the same sequence together and assign per-point `sequence` and `frame` indices after the transform step:
+    ```python
+    frames = []
+    for frame_id, raw_point in enumerate(point_sequence):
+      point = transform(raw_point)
+      num_points = point["coord"].shape[0]
+      point["sequence"] = torch.zeros(num_points, dtype=torch.long)
+      point["frame"] = torch.full((num_points,), frame_id, dtype=torch.long)
+      frames.append(point)
+    point = sonata.data.collate_fn(frames)
+    ```
+    To build a multi-sequence batch, use different sequence ids for each video clip before calling `collate_fn`.
+    The new batch-forward demo supports both the real pre-trained path and an offline smoke test:
+    ```bash
+    python demo/3_batch_forward.py --device cuda
+    python demo/3_batch_forward.py --synthetic --random-init --no-vis --device cpu --num-sequences 2 --num-frames 3
+    ```
   As Sonata is a pre-trained **encoder-only** PTv3, the default output of the model is point cloud after hierarchical encoding. The encoded point feature can be mapping back to original scale with the following code:
   ```python
   for _ in range(2):

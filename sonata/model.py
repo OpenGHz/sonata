@@ -22,6 +22,7 @@ Please cite our work if the code is helpful to you.
 
 
 import os
+import math
 from packaging import version
 from huggingface_hub import hf_hub_download, PyTorchModelHubMixin
 from addict import Dict
@@ -47,6 +48,49 @@ MODELS = [
     "sonata_small",
     "sonata_linear_prob_head_sc",
 ]
+
+
+def build_temporal_sincos(frame, channels, dtype):
+    if channels == 0:
+        return torch.zeros(frame.shape[0], 0, device=frame.device, dtype=dtype)
+    half_channels = channels // 2
+    if half_channels == 0:
+        return torch.zeros(frame.shape[0], channels, device=frame.device, dtype=dtype)
+    scale = math.log(10000.0) / max(half_channels - 1, 1)
+    freq = torch.exp(
+        -torch.arange(half_channels, device=frame.device, dtype=torch.float32) * scale
+    )
+    angle = frame.float().unsqueeze(-1) * freq.unsqueeze(0)
+    embedding = torch.cat([torch.sin(angle), torch.cos(angle) - 1.0], dim=-1)
+    if embedding.shape[1] < channels:
+        embedding = torch.cat(
+            [
+                embedding,
+                torch.zeros(
+                    embedding.shape[0],
+                    channels - embedding.shape[1],
+                    device=frame.device,
+                    dtype=embedding.dtype,
+                ),
+            ],
+            dim=-1,
+        )
+    return embedding.to(dtype)
+
+
+def get_point_sequence_frame(point):
+    if "frame" not in point.keys() or "grid_coord" not in point.keys():
+        return None, None
+    frame = point.frame.reshape(-1).long()
+    if frame.shape[0] != point.feat.shape[0]:
+        return None, None
+    if "sequence" in point.keys():
+        sequence = point.sequence.reshape(-1).long()
+        if sequence.shape[0] != point.feat.shape[0]:
+            return None, None
+    else:
+        sequence = torch.zeros_like(frame)
+    return sequence, frame
 
 
 class LayerScale(nn.Module):
@@ -101,6 +145,7 @@ class SerializedAttention(PointModule):
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
+        enable_temporal=False,
     ):
         super().__init__()
         assert channels % num_heads == 0
@@ -112,6 +157,7 @@ class SerializedAttention(PointModule):
         self.upcast_softmax = upcast_softmax
         self.enable_rpe = enable_rpe
         self.enable_flash = enable_flash
+        self.enable_temporal = enable_temporal
         if enable_flash:
             assert (
                 enable_rpe is False
@@ -207,6 +253,76 @@ class SerializedAttention(PointModule):
             )
         return point[pad_key], point[unpad_key], point[cu_seqlens_key]
 
+    def get_temporal_feat(self, point):
+        if not self.enable_temporal:
+            return None
+        sequence, frame = get_point_sequence_frame(point)
+        if sequence is None:
+            return None
+        if torch.unique(frame).numel() <= 1:
+            return None
+
+        _, sequence_inverse = torch.unique(sequence, sorted=True, return_inverse=True)
+        num_sequence = int(sequence_inverse.max().item()) + 1
+        sequence_max = torch.empty(num_sequence, device=frame.device, dtype=frame.dtype)
+        for index in range(num_sequence):
+            sequence_max[index] = frame[sequence_inverse == index].max()
+        relative_frame = frame - sequence_max[sequence_inverse]
+
+        temporal_input = point.feat + build_temporal_sincos(
+            relative_frame, self.channels, point.feat.dtype
+        )
+        qkv = self.qkv(temporal_input).reshape(
+            -1, 3, self.num_heads, self.channels // self.num_heads
+        )
+        q, k, v = qkv.unbind(dim=1)
+
+        temporal_key = torch.cat(
+            [sequence_inverse.unsqueeze(-1), point.grid_coord.long()], dim=1
+        )
+        _, group_inverse = torch.unique(temporal_key, sorted=True, return_inverse=True, dim=0)
+
+        frame_order = torch.argsort(frame, stable=True)
+        group_order = torch.argsort(group_inverse[frame_order], stable=True)
+        sorted_index = frame_order[group_order]
+        sorted_group = group_inverse[sorted_index]
+        counts = torch.bincount(sorted_group)
+
+        temporal_feat = torch.zeros_like(point.feat)
+        start = 0
+        for count in counts.tolist():
+            if count <= 1:
+                start += count
+                continue
+
+            index = sorted_index[start : start + count]
+            start += count
+
+            q_group = q[index]
+            k_group = k[index]
+            v_group = v[index]
+            if self.upcast_attention:
+                q_group = q_group.float()
+                k_group = k_group.float()
+
+            q_group = q_group.permute(1, 0, 2)
+            k_group = k_group.permute(1, 0, 2)
+            v_group = v_group.permute(1, 0, 2)
+            attn = (q_group * self.scale) @ k_group.transpose(-2, -1)
+            causal_mask = torch.triu(
+                torch.ones(count, count, device=attn.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            attn = attn.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            if self.upcast_softmax:
+                attn = attn.float()
+            attn = self.softmax(attn).to(v_group.dtype)
+            temporal_feat[index] = (attn @ v_group).permute(1, 0, 2).reshape(
+                count, self.channels
+            )
+
+        return temporal_feat
+
     def forward(self, point):
         if not self.enable_flash:
             self.patch_size = min(
@@ -252,6 +368,9 @@ class SerializedAttention(PointModule):
             ).reshape(-1, C)
             feat = feat.to(qkv.dtype)
         feat = feat[inverse]
+        temporal_feat = self.get_temporal_feat(point)
+        if temporal_feat is not None:
+            feat = feat + temporal_feat
 
         # ffn
         feat = self.proj(feat)
@@ -308,6 +427,7 @@ class Block(PointModule):
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
+        enable_temporal=False,
     ):
         super().__init__()
         self.channels = channels
@@ -344,6 +464,7 @@ class Block(PointModule):
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
             upcast_softmax=upcast_softmax,
+            enable_temporal=enable_temporal,
         )
         self.norm2 = PointSequential(norm_layer(channels))
         self.ls2 = PointSequential(
@@ -462,6 +583,10 @@ class GridPooling(PointModule):
             point_dict["condition"] = point.condition
         if "context" in point.keys():
             point_dict["context"] = point.context
+        if "sequence" in point.keys():
+            point_dict["sequence"] = point.sequence[head_indices]
+        if "frame" in point.keys():
+            point_dict["frame"] = point.frame[head_indices]
         if "name" in point.keys():
             point_dict["name"] = point.name
         if "split" in point.keys():
@@ -594,6 +719,9 @@ class PointTransformerV3(PointModule, PyTorchModelHubMixin):
         mask_token=False,
         enc_mode=False,
         freeze_encoder=False,
+        enable_temporal=False,
+        temporal_every=4,
+        temporal_return_current=False,
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -601,6 +729,9 @@ class PointTransformerV3(PointModule, PyTorchModelHubMixin):
         self.enc_mode = enc_mode
         self.shuffle_orders = shuffle_orders
         self.freeze_encoder = freeze_encoder
+        self.enable_temporal = enable_temporal
+        self.temporal_every = temporal_every
+        self.temporal_return_current = temporal_return_current
 
         assert self.num_stages == len(stride) + 1
         assert self.num_stages == len(enc_depths)
@@ -630,6 +761,7 @@ class PointTransformerV3(PointModule, PyTorchModelHubMixin):
             x.item() for x in torch.linspace(0, drop_path, sum(enc_depths))
         ]
         self.enc = PointSequential()
+        block_index = 0
         for s in range(self.num_stages):
             enc_drop_path_ = enc_drop_path[
                 sum(enc_depths[:s]) : sum(enc_depths[: s + 1])
@@ -647,6 +779,11 @@ class PointTransformerV3(PointModule, PyTorchModelHubMixin):
                     name="down",
                 )
             for i in range(enc_depths[s]):
+                use_temporal = (
+                    self.enable_temporal
+                    and self.temporal_every > 0
+                    and (block_index + 1) % self.temporal_every == 0
+                )
                 enc.add(
                     Block(
                         channels=enc_channels[s],
@@ -668,9 +805,11 @@ class PointTransformerV3(PointModule, PyTorchModelHubMixin):
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
+                        enable_temporal=use_temporal,
                     ),
                     name=f"block{i}",
                 )
+                block_index += 1
             if len(enc) != 0:
                 self.enc.add(module=enc, name=f"enc{s}")
 
@@ -699,6 +838,11 @@ class PointTransformerV3(PointModule, PyTorchModelHubMixin):
                     name="up",
                 )
                 for i in range(dec_depths[s]):
+                    use_temporal = (
+                        self.enable_temporal
+                        and self.temporal_every > 0
+                        and (block_index + 1) % self.temporal_every == 0
+                    )
                     dec.add(
                         Block(
                             channels=dec_channels[s],
@@ -720,9 +864,11 @@ class PointTransformerV3(PointModule, PyTorchModelHubMixin):
                             enable_flash=enable_flash,
                             upcast_attention=upcast_attention,
                             upcast_softmax=upcast_softmax,
+                            enable_temporal=use_temporal,
                         ),
                         name=f"block{i}",
                     )
+                    block_index += 1
                 self.dec.add(module=dec, name=f"dec{s}")
         if self.freeze_encoder:
             for p in self.embedding.parameters():
@@ -752,7 +898,55 @@ class PointTransformerV3(PointModule, PyTorchModelHubMixin):
         point = self.enc(point)
         if not self.enc_mode:
             point = self.dec(point)
+        if self.temporal_return_current:
+            point = self.get_current_frame(point)
         return point
+
+    @staticmethod
+    def get_current_frame(point):
+        sequence, frame = get_point_sequence_frame(point)
+        if sequence is None:
+            return point
+
+        _, sequence_inverse = torch.unique(sequence, sorted=True, return_inverse=True)
+        num_sequence = int(sequence_inverse.max().item()) + 1
+        sequence_max = torch.empty(num_sequence, device=frame.device, dtype=frame.dtype)
+        for index in range(num_sequence):
+            sequence_max[index] = frame[sequence_inverse == index].max()
+        keep_mask = frame == sequence_max[sequence_inverse]
+        if keep_mask.all():
+            return point
+
+        point_dict = {}
+        stale_keys = {
+            "offset",
+            "batch",
+            "serialized_code",
+            "serialized_order",
+            "serialized_inverse",
+            "sparse_conv_feat",
+            "sparse_shape",
+            "pad",
+            "unpad",
+            "cu_seqlens_key",
+            "pooling_parent",
+            "pooling_inverse",
+            "unpooling_parent",
+        }
+        for key, value in point.items():
+            if key in stale_keys or key.startswith("rel_pos_"):
+                continue
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == keep_mask.shape[0]:
+                point_dict[key] = value[keep_mask]
+            else:
+                point_dict[key] = value
+
+        sequence_kept = sequence[keep_mask]
+        _, batch = torch.unique(sequence_kept, sorted=True, return_inverse=True)
+        point_dict["batch"] = batch
+        point_dict["sequence"] = batch
+        point_dict["frame"] = torch.zeros_like(batch)
+        return Point(point_dict)
 
 
 def load(

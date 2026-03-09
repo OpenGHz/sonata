@@ -43,6 +43,8 @@ class Point(Dict):
     - "batch": if not exist, initialized as batch size is 1;
     - "feat": feature of point cloud, default input of model;
     - "grid_size": Grid size of point cloud (related to GridSampling);
+    - "sequence": sequence id of each point for temporal fusion;
+    - "frame": frame index of each point for temporal fusion;
     (related to Serialization)
     - "serialized_depth": depth of serialization, 2 ** depth * grid_size describe the maximum of point cloud range;
     - "serialized_code": a list of serialization codes;
